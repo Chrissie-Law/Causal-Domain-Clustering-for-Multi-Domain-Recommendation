@@ -28,6 +28,15 @@ from dataset.aliccp.preprocess_ali_ccp import reduce_mem
 
 
 class Run(object):
+    """
+    Main execution class for multi-domain recommendation experiments.
+
+    This class handles the entire experimentation pipeline:
+    1. Data loading and preprocessing
+    2. Model initialization
+    3. Training and evaluation
+    4. Metrics tracking
+    """
     def __init__(self, config):
         device = 'cuda:' + str(config.gpu) if config.use_cuda and torch.cuda.is_available() else 'cpu'
         self.device = torch.device(device)
@@ -35,7 +44,8 @@ class Run(object):
         self.base_model = config.base_model
         self.epoch = config.epoch
         self.embed_dim = config.embed_dim
-        # 当model包含聚类算法时，使用mix混合数据再根据n_cluster进行聚类；为其他模型时，使用给定聚类
+        # When model includes clustering algorithms, use 'mix' to combine data then cluster by n_cluster;
+        # for other models, use pre-defined clustering
         self.n_cluster = config.n_cluster
         self.domain2encoder_dict = config.domain2encoder_dict
         self.domain2group_list = config.domain2group_org_dict[config.dataset_name][config.group_strategy]
@@ -70,12 +80,6 @@ class Run(object):
         self.train_data_loader, self.valid_data_loader, self.test_data_loader = None, None, None
         self.train_data_generator, self.valid_data_generator, self.test_data_generator = None, None, None
 
-        # find the latest model
-        # all_models = [f for f in os.listdir(self.config.save_path) if f.startswith(f'{self.model}') and f.endswith('.pth.tar')]
-        # if all_models:
-        #     latest_model_inx = max([int(x.split('_')[1].split('.')[0]) for x in all_models])
-        # else:
-        #     latest_model_inx = 0
         self.latest_model_inx = np.random.randint(50)
         self.save_model_path = os.path.join(self.config.save_path, f'{self.model}_{self.latest_model_inx+1}.pth.tar')
         if not os.path.exists(self.config.save_path):
@@ -83,7 +87,7 @@ class Run(object):
             print(f'create save_path folder: {self.config.save_path}')
         print('save_model_path: ', self.save_model_path)
 
-        # for early stop
+        # Early stopping parameters
         self.num_trials = config.early_stop
         self.trial_counter = 0
         self.best_loss, self.best_mean_loss = np.inf, np.inf
@@ -92,6 +96,19 @@ class Run(object):
         wandb.log({'domain2group_list': self.domain2group_list, 'n_tower': self.n_tower})
 
     def read_split_data(self, path, only_id=False):
+        """
+        Read a preprocessed CSV and construct train/valid/test splits and feature metadata.
+        - Amazon: split by timestamp quantiles (0.90/0.95)
+        - AliCCP: use preassigned split via 'train_tag' (0:train,1:val,2:test)
+        Optionally filter domains ('domain_filter')
+
+        Args:
+            path (str): Path to the preprocessed .csv
+            only_id (bool): If True, keep only userid/itemid/domain as features
+
+        Returns:
+            (list, tuple): (feature+label columns, (train_df, val_df, test_df)) or (cols, (None,None,None)) in fast mode
+        """
         if only_id:
             x_cols = ['userid', 'itemid', 'domain']
             self.feature_names = x_cols
@@ -103,15 +120,14 @@ class Run(object):
         y_col = [self.label_name]
         return_cols = x_cols + y_col
         if self.dataset_name == 'amazon':
-            # 使用timestamp作为划分数据集的依据
+            # Use timestamp for dataset splitting
             split_col = 'timestamp'
         elif self.dataset_name == 'aliccp':
-            # preprocess_ali_ccp.py中已经将数据集划分好了，预处理时打了train_tag标签
+            # Data already split in preprocess_ali_ccp.py with train_tag labels
             split_col = 'train_tag'  # train_tag: 0-train, 1-val, 2-test
         cols = x_cols + y_col + [split_col]
 
         data = reduce_mem(pd.read_csv(path, usecols=cols))
-        # data.sort_values(by=['timestamp', 'domain'], inplace=True)
         if self.dataset_name == 'amazon':
             self.train_valid, self.valid_test = data[split_col].quantile(0.9), data[split_col].quantile(0.95)
         else:
@@ -135,8 +151,8 @@ class Run(object):
                    'save_model_path': self.save_model_path,
                    'feature_names': self.feature_names})
 
-        if self.domain_filter is None:  # (self.config.is_set_seed == 0) and (self.domain_filter is None):
-            # 高效跑程序模式（无随机种子）且不需要筛domain->不做数据统计，直接读取预处理好的数据
+        if self.domain_filter is None:
+            # No domain filtering -> directly read preprocessed data for faster loading
             del data
             return return_cols, (None, None, None)
 
@@ -164,7 +180,7 @@ class Run(object):
             print(f'test  time: {datetime.fromtimestamp(test_data["timestamp"].min()).strftime("%Y-%m-%d")} '
                   f'to {datetime.fromtimestamp(test_data["timestamp"].max()).strftime("%Y-%m-%d")}')
 
-        # count overlap
+        # Calculate overlap statistics
         print('Calculate the user overlap between train_data, valid_data and test_data')
         train_user_ids = set(train_data['userid'].unique())
         valid_user_ids = set(valid_data['userid'].unique())
@@ -192,6 +208,18 @@ class Run(object):
                              test_data[return_cols])
 
     def save_tensor_from_data(self, data, cols, mode):
+        """
+        Convert dataframe to tensors and persist to disk for fast reload.
+        Saves two files under preprocess_folder: `{mode}_data_loader.pth` and `{mode}_label_loader.pth`.
+
+        Args:
+            data (pd.DataFrame): Input tabular data.
+            cols (list): Columns to extract (features + label).
+            mode (str): 'train' | 'valid' | 'test'
+
+        Returns:
+            (Tensor, Tensor): (X, y) tensors.
+        """
         x_cols = [col for col in cols if col != self.label_name]
         y_col = [self.label_name]
         print('save_tensor_from_data: x_cols:', x_cols)
@@ -205,6 +233,18 @@ class Run(object):
         return X, y
 
     def convert2data_loader(self, data, cols, mode):
+        """
+        Build a standard (mixed-domain) DataLoader.
+        If cached tensors exist, load them; otherwise persist converted tensors for reuse.
+
+        Args:
+            data (pd.DataFrame or None): Data for the split (may be None in fast mode).
+            cols (list): Column names.
+            mode (str): 'train' | 'valid' | 'test'
+
+        Returns:
+            DataLoader: A mixed-domain PyTorch DataLoader.
+        """
         cols = cols if data is None else data.columns
         x_cols = [col for col in cols if col != self.label_name]
         y_col = [self.label_name]
@@ -246,6 +286,20 @@ class Run(object):
         return data_loader
 
     def convert2domain_data_loader(self, data, cols, mode):
+        """
+        Build a list of per-domain DataLoaders for CDC model.
+
+        For each domain d, this creates a separate loader and records the domain-batch sequence,
+        which CDC uses to alternate domain treatments and compute transfer effects.
+
+        Args:
+            data (pd.DataFrame or None): Data for the split.
+            cols (list): Column names.
+            mode (str): 'train' | 'valid' | 'test'
+
+        Returns:
+            list[DataLoader]: One DataLoader per domain.
+        """
         cols = cols if data is None else data.columns
         x_cols = [col for col in cols if col != self.label_name]
 
@@ -293,6 +347,11 @@ class Run(object):
         return domain_data_loader
 
     def get_data(self):
+        """
+        Top-level data entry:
+          - Read split CSV
+          - Return mixed-domain loaders for baselines, or per-domain loaders for CDC
+        """
         print('========Reading data========')
         cols, data = self.read_split_data(self.preprocess_path)
         print('after multi-hot features flatten')
@@ -309,6 +368,10 @@ class Run(object):
         return self.train_data_loader, self.valid_data_loader, self.test_data_loader
 
     def get_model(self):
+        """
+        Instantiate the selected model with current feature dimensions and towers/groups.
+        For CDC, wrap the chosen base model (e.g., MMoE/PLE/PEPNet/STAR) and pass CDC-specific configs.
+        """
         if self.model == 'deepfm':
             assert self.config.group_strategy == 'mix', 'deepfm only support mix group strategy'
             model = DeepFM(self.feature_dims, self.embed_dim, mlp_dims=(256, 128),
@@ -393,8 +456,8 @@ class Run(object):
                          l2_reg_linear=self.config.l2_reg_dnn,
                          l2_reg_dnn=self.config.l2_reg_dnn)
         elif self.model == 'adl' or self.model == 'adl-split':
-            # adl: 由n_cluster确定n_tower
-            # adl-split: 由domain2group_dict确定n_tower
+            # adl: n_tower determined by 'n_cluster'
+            # adl-split: n_tower determined by 'domain2group_dict'
             model = ADL(self.feature_dims, self.embed_dim, n_tower=self.n_tower,
                         tower_dims=self.config.tower_dims, domain_idx=self.domain_idx, dlm_iters=self.config.dlm_iters,
                         device=self.device, config=self.config,
@@ -418,27 +481,32 @@ class Run(object):
         elif self.model == 'cdc':
             assert self.config.group_strategy == 'mix', 'cdc only support mix group strategy'
             model = CDC(self.feature_dims, self.embed_dim,
-                             n_tower=self.n_tower,
-                             n_domain=self.n_domain,
-                             base_model=self.base_model,
-                             expert_dims=self.config.mlp_dims,
-                             tower_dims=self.config.cdc_tower_dims,
-                             domain_idx=self.domain_idx,
-                             domain_cnt_weight=self.domain_cnt_weight,
-                             n_causal_mask=self.config.n_causal_mask,
-                             use_metric=self.config.use_metric,
-                             device=self.device,
-                             config=self.config,
-                             savefig_folder=f'{self.model}_{self.latest_model_inx + 1}',
-                             l2_reg_embedding=self.config.l2_reg_embedding,
-                             l2_reg_linear=self.config.l2_reg_dnn,
-                             l2_reg_dnn=self.config.l2_reg_dnn)
+                        n_tower=self.n_tower,
+                        n_domain=self.n_domain,
+                        base_model=self.base_model,
+                        expert_dims=self.config.mlp_dims,
+                        tower_dims=self.config.cdc_tower_dims,
+                        domain_idx=self.domain_idx,
+                        domain_cnt_weight=self.domain_cnt_weight,
+                        n_causal_mask=self.config.n_causal_mask,
+                        use_metric=self.config.use_metric,
+                        device=self.device,
+                        config=self.config,
+                        savefig_folder=f'{self.model}_{self.latest_model_inx + 1}',
+                        l2_reg_embedding=self.config.l2_reg_embedding,
+                        l2_reg_linear=self.config.l2_reg_dnn,
+                        l2_reg_dnn=self.config.l2_reg_dnn)
         else:
             raise ValueError('Unknown model: ' + self.model)
         return model.to(self.device)
 
     def is_continuable(self, model, result_dict, epoch_i, optimizer):
-        # if result_dict['total_auc'] > self.best_auc:
+        """
+        Check whether to continue training based on validation results.
+
+        Returns:
+            bool: True if training should continue, False otherwise
+        """
         if result_dict['mean_auc'] > self.best_mean_auc:  # use mean_auc to early stop
             print('use mean_auc to early stop')
             self.trial_counter = 0
@@ -468,6 +536,9 @@ class Run(object):
             return False
 
     def train(self, data_loader, model, criterion, optimizer, epoch_i):
+        """
+        Train the baseline model (non-CDC) for one epoch.
+        """
         print('Training Epoch {}:'.format(epoch_i + 1))
         model.train()
         loss_sum = 0
@@ -497,6 +568,19 @@ class Run(object):
                 loss_sum = 0
 
     def get_domain_data(self, d, mode='train'):
+        """
+        Fetch one mini-batch for a specific domain (or a list of domains).
+
+        If `d` is an int: return the next batch from that domain's generator; auto-restart on StopIteration.
+        If `d` is a list: concatenate a batch from each domain listed (shuffled), used by CDC internal updates.
+
+        Args:
+            d (int or list[int]): Domain id or a list of ids.
+            mode (str): 'train' | 'valid' | 'test'
+
+        Returns:
+            (Tensor, Tensor): (X, y) batch on device.
+        """
         if isinstance(d, (int, np.integer)):
             if mode == 'train':
                 try:
@@ -526,6 +610,22 @@ class Run(object):
             return torch.cat(torch_X, dim=0), torch.cat(torch_y, dim=0)
 
     def update_matrix_cdc(self, model, criterion, optimizer, update_matrix_step):
+        """
+        Core CDC update: compute treatment matrices and refresh grouping.
+
+        Steps:
+          1) Save base model state (to rollback after each probing update)
+          2) Build treatment mask matrix by randomly sampling domain sets and applying short updates
+          3) Compute Isolated Domain Affinity Matrix (matrix_A)
+          4) Compute Hybrid Domain Affinity Matrix (matrix_B)
+          5) Call `model.update_group()` to (re)assign domains to target/source groups
+
+        Args:
+            model: CDC model instance
+            criterion: Loss function
+            optimizer: Optimizer
+            update_matrix_step: Number of steps for each matrix update
+        """
         def cdc_train_update_with_domain(train_domain_i, mode, num_interval):
             if isinstance(train_domain_i, (int, np.integer)):
                 train_domain_i_list = [train_domain_i] * num_interval
@@ -557,9 +657,10 @@ class Run(object):
                     matrix_one_line[d_j] = model.get_matrix_metric(pred.squeeze(), domain_train_y.squeeze().float())
             return torch.tensor(matrix_one_line, dtype=torch.float).to(self.device)
 
+        # Save current model state to restore after matrix updates
         model.save_model_state()
 
-        # get treatment matrix
+        # Calculate treatment matrix for causal discovery
         for line_i in tqdm.tqdm(range(self.config.n_causal_mask), desc='Get causal mask', mininterval=20):
             train_domain_i = np.random.choice(range(self.n_domain),
                                               p=self.domain_cnt_weight,
@@ -568,7 +669,7 @@ class Run(object):
             model.matrix_mask[line_i] = cdc_test_all_domain()
             model.load_model_state()
 
-        # get matrix A
+        # Calculate Isolated Domain Affinity Matrix (matrix_A)
         model.matrix_A[self.n_domain] = cdc_test_all_domain()
         for d_i in tqdm.tqdm(range(self.n_domain), desc='Get matrix A', mininterval=15):
             model.train()
@@ -576,9 +677,9 @@ class Run(object):
             model.matrix_A[d_i] = cdc_test_all_domain()
             model.load_model_state()
 
-        # get matrix B
+        # Calculate Hybrid Domain Affinity Matrix (matrix_B)
         if max(model.domain2group_list) > 0:
-            # 已经有了分组，那matrix B的全集就按照单组中所有的domain算
+            # Domain grouping exists, calculate matrix_B for each group and each domain
             tk_B = tqdm.tqdm(range(self.n_domain+self.n_cluster), desc='Get matrix B', mininterval=15)
         else:
             tk_B = tqdm.tqdm(range(self.n_domain+1), desc='Get matrix B', mininterval=15)
@@ -591,9 +692,16 @@ class Run(object):
             model.matrix_B[d_i] = cdc_test_all_domain()
             model.load_model_state()
 
+        # Update domain groupings based on affinity matrices
         self.domain2group_list = model.update_group()
 
     def train_cdc(self, model, criterion, optimizer, epoch_i):
+        """
+        CDC training epoch:
+          - (First epoch) Warm-up on random domains with shared towers
+          - Periodically update A/B/Mask matrices and regroup domains (CODC)
+          - Train with split mode (group-specific towers) on per-domain mini-batches
+        """
         print('Training Epoch {}:'.format(epoch_i + 1))
         model.train()
         log_interval = 204800//self.config.bs
@@ -605,7 +713,7 @@ class Run(object):
         print(f'warmup_step: {warmup_step}, '
               f'update_matrix_step: {update_matrix_step}, update_interval: {update_interval}')
 
-        # warm up the model
+        # Initial warm-up phase for the model
         if epoch_i == 0:
             print('========Warm up========')
             loss_sum = 0
@@ -626,6 +734,7 @@ class Run(object):
                     loss_sum = 0
             del loss_sum
 
+        # Main training loop with periodic matrix updates
         loss_sum = 0
         tk0 = tqdm.tqdm(self.train_domain_batch_seq, smoothing=0, desc=f'Training Epoch {epoch_i + 1}', mininterval=30)
         for i, d in enumerate(tk0):
@@ -644,7 +753,20 @@ class Run(object):
                 wandb.log({'train_loss': (loss_sum / log_interval)})
                 loss_sum = 0
 
-    def test(self, data_loader, model, mode='valid', cdc_final=False):
+    def test(self, data_loader, model, mode='valid'):
+        """
+        Evaluate the model on validation or test data.
+        - CDC: iterate by domain-batch sequence and run split mode
+        - Baselines: evaluate on mixed-domain mini-batches
+
+        Args:
+            data_loader: DataLoader for evaluation data
+            model: Model to evaluate
+            mode: Evaluation mode ('valid' or 'test')
+
+        Returns:
+            result_dict (dict): Dictionary of evaluation metrics
+        """
         print('Evaluating:')
         model.eval()
         targets, predicts, domains = [], [], []
@@ -681,13 +803,24 @@ class Run(object):
         result_dict = dict()
         result_dict['total_auc'] = roc_auc_score(targets, predicts)
         result_dict['total_loss'] = log_loss(targets, predicts)
-        # print(type(result_dict['total_auc']), type(result_dict['total_loss']))
         if self.config.is_evaluate_multi_domain:
             result_dict.update(self.evaluate_multi_domain(targets, predicts, domains))
 
         return result_dict
 
     def evaluate_multi_domain(self, targets, predicts, domains, return_type='dict'):
+        """
+        Compute per-domain AUC/Loss and weighted means using domain frequency.
+
+        Args:
+            targets (ndarray): Ground-truth labels across all examples.
+            predicts (ndarray): Predicted probabilities across all examples.
+            domains (ndarray): Domain id for each example.
+            return_type (str): 'dict' or 'array' (dict is default)
+
+        Returns:
+            dict: {'domain_auc', 'domain_loss', 'mean_auc', 'mean_loss'}
+        """
         df = pd.DataFrame({'targets': targets, 'predicts': predicts, 'domains': domains})
         if return_type == 'dict':
             domain_auc, domain_loss = dict(), dict()
@@ -700,7 +833,7 @@ class Run(object):
                 auc = roc_auc_score(group['targets'], group['predicts'])
                 loss = log_loss(group['targets'], group['predicts'])
             except ValueError:
-                # 处理无法计算 AUC 或 Loss 的情况（例如，某个类别的标签只有一种）
+                # Handle cases where AUC or Loss can't be calculated (e.g., only one class of labels)
                 auc, loss = np.nan, np.nan
 
             domain_auc[domain], domain_loss[domain] = auc, loss
@@ -711,6 +844,12 @@ class Run(object):
                      'mean_auc': mean_auc, 'mean_loss': mean_loss})
 
     def main(self):
+        """
+        Main entry:
+          - Prepare data and instantiate model/optimizer/loss
+          - Train + validate with early stop (CDC uses train_cdc)
+          - Reload best checkpoint and run final test
+        """
         train_data_loader, valid_data_loader, test_data_loader = self.get_data()
         if 'cdc' in self.model and ('wo' not in self.model):
             self.train_data_generator = [iter(self.train_data_loader[d]) for d in range(self.n_domain)]
@@ -730,6 +869,7 @@ class Run(object):
             model.load_state_dict(checkpoint['state_dict'])
 
         if 'cdc' in self.model:
+            # Training loop for CDC model
             for epoch_i in range(self.epoch):
                 self.train_cdc(model, criterion, optimizer, epoch_i)
                 result_dict = self.test(valid_data_loader, model, mode='valid')
@@ -740,10 +880,10 @@ class Run(object):
                           f'mean_loss: {result_dict["mean_loss"]:.4f}')
                 if not self.is_continuable(model, result_dict, epoch_i, optimizer):
                     break
-            # print(f'cdc domain2group: {model.domain2group_list}')
             wandb.log({'domain2group_list': model.domain2group_list})
             wandb.log({'s_group2domain_list': model.s_group2domain_list})
         else:
+            # Training loop for other models
             for epoch_i in range(self.epoch):
                 self.train(train_data_loader, model, criterion, optimizer, epoch_i)
                 result_dict = self.test(valid_data_loader, model, mode='valid')
@@ -755,6 +895,7 @@ class Run(object):
                 if not self.is_continuable(model, result_dict, epoch_i, optimizer):
                     break
 
+        # Final evaluation on test data
         print('loading best model...')
         checkpoint = torch.load(self.save_model_path, map_location=self.device)
         model.load_state_dict(checkpoint['state_dict'])

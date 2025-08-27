@@ -19,9 +19,30 @@ from dataset.aliccp.preprocess_ali_ccp import reduce_mem
 
 
 class DataPreprocessing(object):
+    """
+    Dataset preprocessing entry for both Amazon and AliCCP.
+
+    Responsibilities:
+      - Configure dataset-specific feature spaces and preprocessing targets
+      - For Amazon: parse product metadata (price/rank/brand/category), discretize dense fields, encode categories
+      - For AliCCP: discretize continuous features (KBinsDiscretizer), sample/merge domains, filter by frequency
+      - Persist a single CSV ready for the training pipeline (used by main.py)
+    """
     def __init__(self, data_path, dataset_name, domains=[], k_cores=3, prepare2train_month=6,
                  downsample_freq_thresh=10, sample_n_domain=50,
                  sample_mode="mix_interval_random", discrete_method="uniform"):
+        """
+        Args:
+            data_path (str): Root directory containing raw/preprocessed files.
+            dataset_name (str): 'amazon' or 'aliccp'.
+            domains (list): Optional white-list of target domains (Amazon only).
+            k_cores (int): k-core filter for (user,item) minimum interactions (Amazon).
+            prepare2train_month (int): Sliding window size (months) for Amazon temporal filtering.
+            downsample_freq_thresh (int): Min frequency threshold for user/item filtering (AliCCP).
+            sample_n_domain (int): Target number of domains after sampling (AliCCP).
+            sample_mode (str): Strategy for domain selection/merging (AliCCP).
+            discrete_method (str): KBinsDiscretizer strategy for numeric features (AliCCP).
+        """
         self.data_path = data_path
         self.dataset_name = dataset_name
         self.domains = domains
@@ -33,7 +54,7 @@ class DataPreprocessing(object):
         if dataset_name == 'amazon':
             self.feature_names = ['userid', 'itemid', 'weekday', 'domain',
                                   'sales_chart', 'sales_rank', 'brand', 'price']
-            # 按照domain中数据量大小进行排序
+            # Domains sorted by data volume
             self.domain2encoder_dict = {'Clothing, Shoes & Jewelry': 0, 'Home & Kitchen': 1, 'Books': 2,
                                         'Electronics': 3, 'Sports & Outdoors': 4, 'Tools & Home Improvement': 5,
                                         'Pet Supplies': 6, 'Automotive': 7, 'Grocery & Gourmet Food': 8,
@@ -64,6 +85,16 @@ class DataPreprocessing(object):
     # for amazon
     @staticmethod
     def process_price(price_str):
+        """
+        Parse noisy price strings into a single numeric bucket (ceil).
+        Handles ranges like "$12.99 - $15.99" by averaging, and strips non-numeric chars.
+
+        Args:
+            price_str (str): Raw price field from metadata.
+
+        Returns:
+            float or None: Ceiled price value; None if parse fails.
+        """
         try:
             if not isinstance(price_str, str) or pd.isnull(price_str) or price_str == '':
                 return None
@@ -79,6 +110,15 @@ class DataPreprocessing(object):
 
     @staticmethod
     def process_rank(sales_rank_str):
+        """
+        Extract item rank and chart/category from Amazon 'salesRank' string.
+
+        Args:
+            sales_rank_str (str): e.g., "1,234 in Electronics"
+
+        Returns:
+            (int or None, str or None): (rank, chart_category)
+        """
         if not isinstance(sales_rank_str, str):
             return None, None
         try:
@@ -89,39 +129,18 @@ class DataPreprocessing(object):
         except ValueError:
             return None, None
 
-    @staticmethod
-    def extract_pos_neg_seq(row):
-        positive_item_seq = []
-        positive_item_seq_timestamp = []
-        negative_item_seq = []
-        negative_item_seq_timestamp = []
-
-        for item, label, timestamp in zip(row['item_seq'], row['item_seq_label'], row['item_seq_timestamp']):
-            if label == 1:
-                positive_item_seq.append(item)
-                positive_item_seq_timestamp.append(timestamp)
-            elif label == 0:
-                negative_item_seq.append(item)
-                negative_item_seq_timestamp.append(timestamp)
-
-        return positive_item_seq, positive_item_seq_timestamp, negative_item_seq, negative_item_seq_timestamp
-
-    @staticmethod
-    def aggregate_pos_neg_seq(group):
-        pos_items = group.loc[group['label'] == 1, 'itemid'].tolist()
-        pos_timestamps = group.loc[group['label'] == 1, 'timestamp'].tolist()
-        neg_items = group.loc[group['label'] == 0, 'itemid'].tolist()
-        neg_timestamps = group.loc[group['label'] == 0, 'timestamp'].tolist()
-
-        return pd.Series({
-            'pos_item_seq': pos_items,
-            'pos_item_seq_timestamp': pos_timestamps,
-            'neg_item_seq': neg_items,
-            'neg_item_seq_timestamp': neg_timestamps
-        })
-
     # for amazon
     def merge_metadata(self, df, k_cores):
+        """
+        Merge Amazon product metadata into interactions and perform basic cleaning/encoding.
+
+        Args:
+            df (pd.DataFrame): Raw interactions with ['itemid','userid','rating','timestamp'].
+            k_cores (int): Threshold for k-core filtering (>= k on both user and item).
+
+        Returns:
+            pd.DataFrame: Enriched interactions with metadata.
+        """
         metadata_path = os.path.join(self.data_path, 'All_Amazon_Meta.json')
 
         # k-cores filter
@@ -137,7 +156,8 @@ class DataPreprocessing(object):
         print(f'user unique = {df.userid.nunique()}, item unique = {df.itemid.nunique()}')
 
         # read item metadata
-        item_meta_df_path = os.path.join(self.data_path, f'item_meta_{self.k_cores}cores_{self.prepare2train_month}month.csv')
+        item_meta_df_path = os.path.join(self.data_path,
+                                         f'item_meta_{self.k_cores}cores_{self.prepare2train_month}month.csv')
         if os.path.exists(item_meta_df_path):
             item_meta_df = pd.read_csv(item_meta_df_path)
         else:
@@ -172,86 +192,34 @@ class DataPreprocessing(object):
         brands_to_replace = brand_counts[brand_counts < 10].index
         item_meta_df['brand'] = item_meta_df['brand'].apply(lambda x: None if x in brands_to_replace else x)
 
-        # process label
+        # process label (ratings > 4 are treated as positives)
         label_threshold = 4.0
         df['label'] = 0
         df.loc[(df.rating > label_threshold), 'label'] = 1
 
-        # encoder itemid
+        # encode itemid
         lbe = LabelEncoder()
         lbe.fit(list(unique_items))
         df['itemid'] = lbe.transform(df['itemid'].astype(str))
         item_meta_df['itemid'] = lbe.transform(item_meta_df['itemid'].astype(str))
-        # with open(os.path.join(self.data_path, 'itemid_encoder.pkl'), 'wb') as f:
-        #     pickle.dump(lbe, f)
-
-        # process user metadata
-        """
-        start = time.time()
-        df.sort_values('timestamp', inplace=True, ignore_index=True)
-        pos_df, neg_df = df.loc[df.label == 1].copy(), df.loc[df.label == 0].copy()
-        pos_user_meta_df = pos_df.groupby('userid').agg({
-            'itemid': lambda x: list(x),
-            'timestamp': lambda x: list(x)
-        }).reset_index().rename(columns={'itemid': 'pos_item_seq', 'timestamp': 'pos_item_seq_timestamp'})
-        neg_user_meta_df = neg_df.groupby('userid').agg({
-            'itemid': lambda x: list(x),
-            'timestamp': lambda x: list(x)
-        }).reset_index().rename(columns={'itemid': 'neg_item_seq', 'timestamp': 'neg_item_seq_timestamp'})
-        print(f'pos_user_meta_df shape = {pos_user_meta_df.shape}, neg_user_meta_df shape = {neg_user_meta_df.shape}')
-        user_meta_df = pd.merge(pos_user_meta_df, neg_user_meta_df, on='userid', how='outer')
-        user_meta_df['pos_item_seq'] = user_meta_df['pos_item_seq'].apply(lambda x: x if isinstance(x, list) else [])
-        user_meta_df['pos_item_seq_timestamp'] = user_meta_df['pos_item_seq_timestamp'].apply(lambda x: x if isinstance(x, list) else [])
-        user_meta_df['neg_item_seq'] = user_meta_df['neg_item_seq'].apply(lambda x: x if isinstance(x, list) else [])
-        user_meta_df['neg_item_seq_timestamp'] = user_meta_df['neg_item_seq_timestamp'].apply(lambda x: x if isinstance(x, list) else [])
-        end = time.time()
-        print(f'user_meta_df shape = {user_meta_df.shape}, build time = {end - start:.2f}s')
-        
-
-        # merge user_meta_df to df
-        start = time.time()
-        df.sort_values('userid', inplace=True, ignore_index=True)
-        user_meta_df.sort_values('userid', inplace=True, ignore_index=True)
-        df['df2user_meta_df'] = user_meta_df['userid'].searchsorted(df['userid'], side='left')
-
-        def get_user_items_seq(row, user_meta_df, delta_days, is_pos):
-            user_meta_row = user_meta_df.iloc[row['df2user_meta_df']]
-            start_time = row['timestamp'] - delta_days
-            end_time = row['timestamp']
-            item_seq = user_meta_row['pos_item_seq'] if is_pos else user_meta_row['neg_item_seq']
-            item_seq_timestamp = user_meta_row['pos_item_seq_timestamp'] if is_pos \
-                else user_meta_row['neg_item_seq_timestamp']
-            selected_items = [item for item, timestamp in zip(item_seq, item_seq_timestamp) if
-                              start_time <= timestamp < end_time]
-            return selected_items
-
-        m = 6
-        days_n = 30*m
-        delta_days = int(timedelta(days=days_n - 1).total_seconds())
-        df[f'user_pos_{m}month_seq'] = df.apply(get_user_items_seq, axis=1,
-                                                user_meta_df=user_meta_df, delta_days=delta_days, is_pos=True)
-        df[f'user_neg_{m}month_seq'] = df.apply(get_user_items_seq, axis=1,
-                                                user_meta_df=user_meta_df, delta_days=delta_days, is_pos=False)
-        print(f'finish getting df.user_pos/neg_{m}month_seq')
-        end = time.time()
-        print(f'df shape = {df.shape}, get df.item_seq time = {end - start:.2f}s')
-        """
 
         df = df.merge(item_meta_df, on='itemid', how='left')
         print('finish merge item meta data to df')
-        # item_meta_df.set_index('itemid', inplace=True).to_dict('index')
-        #
-        # for col in ['price', 'sales_rank', 'sales_chart', 'brand', 'domain']:
-        #     df[col] = df['itemid'].map(lambda x: item_meta_df.get(x, {}).get(col, np.nan))
 
         df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
         df['weekday'] = df['datetime'].dt.dayofweek
-        df['hour'] = df['datetime'].dt.hour  # hour都是0
+        df['hour'] = df['datetime'].dt.hour
 
         return df
 
     # for ali-ccp
     def discrete(self, discrete_paths):
+        """
+        Discretize continuous features for AliCCP using KBinsDiscretizer.
+
+        Args:
+            discrete_paths (tuple): (train_out_path, val_out_path, test_out_path)
+        """
         print("Discretize continuous features, fit and transform on train, transform on val and test")
         print(discrete_paths)
         # train_path, val_path, test_path
@@ -262,24 +230,21 @@ class DataPreprocessing(object):
             raise ValueError("Train, val, test data not prepared. Please run preprocess_ali_ccp.py first")
         else:
             print("Train, val, test data already prepared")
-        # train_df, val_df, test_df = pd.read_csv(train_path), pd.read_csv(val_path), pd.read_csv(test_path)
         train_val_test_df = (pd.read_csv(train_val_test_path[0]),
                              pd.read_csv(train_val_test_path[1]),
                              pd.read_csv(train_val_test_path[2]))
         print("train_val_test_df:", [df.shape for df in train_val_test_df])
 
         from sklearn.preprocessing import KBinsDiscretizer
-        # combined_df = pd.concat([train_df, val_df, test_df], ignore_index=True)
         columns_to_discretize = ['D109_14', 'D110_14', 'D127_14', 'D150_14', 'D508', 'D509', 'D702', 'D853']
         print("columns_to_discretize:", columns_to_discretize)
 
-        # 使用KBinsDiscretizer进行离散化
+        # Discretize using KBinsDiscretizer (fit on train; transform val/test)
         for column in tqdm(columns_to_discretize, mininterval=5):
             discretizer = KBinsDiscretizer(n_bins=10, encode='ordinal',
                                            strategy=self.discrete_method,
                                            subsample=int(2e5) if self.discrete_method == 'quantile' else None)
-            # combined_df[column] = discretizer.fit_transform(combined_df[[column]]).astype(int)
-            discretizer.fit(train_val_test_df[0][[column]])  # 仅使用训练集来fit
+            discretizer.fit(train_val_test_df[0][[column]])  # fit on training set only
             for i in range(3):
                 train_val_test_df[i][column] = discretizer.transform(train_val_test_df[i][[column]]).astype(int)
 
@@ -290,13 +255,27 @@ class DataPreprocessing(object):
         print("Discretization done")
 
     def filter_dataframe_by_threshold(self, df_paths, thresh, n_domain, sample_mode):
+        """
+        Filter AliCCP data by frequency and sample/merge domains according to `sample_mode`.
+
+        Args:
+            df_paths (tuple): (train_csv, val_csv, test_csv) after discretization.
+            thresh (int): Frequency threshold to keep users and items.
+            n_domain (int): Number of target domains to keep.
+            sample_mode (str): One of {'nlargest','random','interval','weighted','interval_random','mix_interval_random'}.
+
+        Returns:
+            filtered_df (pd.DataFrame): Filtered DataFrame with sampled domains
+            domain_id_mapping (dict): Mapping from original domain IDs to new IDs
+            inverse_domain_id_mapping (dict): Mapping from new domain IDs to original IDs
+        """
         with open(f"{self.preprocess_path.split(',')[0]}.log", 'w') as log_file:
             df_num = len(df_paths)
             train_tags = [0, 1, 2]
             dfs, df_row_nums = [], []
             for i in range(df_num):
                 dfs.append(reduce_mem(pd.read_csv(df_paths[i])))
-                dfs[i]['train_tag'] = train_tags[i]  # 增加一个标记列来区分train, val, test
+                dfs[i]['train_tag'] = train_tags[i]  # Add tag to distinguish train, val, test
                 df_row_nums.append(dfs[i].shape[0])
             df = pd.concat(dfs, ignore_index=True)
 
@@ -307,21 +286,21 @@ class DataPreprocessing(object):
             print('Train_tag:', train_tags[:df_num])
             print(f"Concat {df_num} dataframes to filter, original row num: {df_row_nums}")
 
-            # 计算用户和商品的频次
+            # Compute user/item frequencies
             user_counts = df['userid'].value_counts()
             item_counts = df['itemid'].value_counts()
 
-            # 过滤出现频次高于等于阈值的用户和商品
+            # Keep entities with frequency >= thresh
             valid_users = user_counts[user_counts >= thresh].index
             valid_items = item_counts[item_counts >= thresh].index
             valid_mask = df['userid'].isin(valid_users) & df['itemid'].isin(valid_items)
 
-            # 应用过滤条件并得到新的DataFrame
+            # Apply filtering conditions and get new DataFrame
             print("Before filter user and item:", df.shape[0])
             filtered_df = df[valid_mask]
             print("After filter user and item:", filtered_df.shape[0])
 
-            # Filtering based on userid and itemid counts within each domain
+            # Filter domains by sufficient unique users/items
             print("Before filter domain:", filtered_df["domain"].value_counts())
             filtered_df = filtered_df.groupby('domain').filter(
                 lambda x: (x['userid'].nunique() >= thresh * 20) & (x['itemid'].nunique() >= thresh * 20))
@@ -349,7 +328,7 @@ class DataPreprocessing(object):
                 weights = domain_counts_f / domain_counts_f.sum()
                 print("weights:", weights)
                 selected_domains = np.random.choice(domain_counts.index, n_domain, p=weights, replace=False)
-            elif sample_mode == "interval_random":  # 分层抽样
+            elif sample_mode == "interval_random":  # stratified sampling
                 # Sort domains based on count and select n domains from each interval
                 sorted_domains = sort_by_count.index
                 large_domains = sorted_domains[:int(0.05 * len(sorted_domains))]
@@ -360,7 +339,7 @@ class DataPreprocessing(object):
                     step = max(1, len(tmp_sorted_domains) // tmp_n_domains)
                     selected_domains.extend(tmp_sorted_domains[::step][:tmp_n_domains])
             elif sample_mode == "mix_interval_random":
-                # 部分domain是由多个domain合成的，最后再分层抽样出来n_domain个
+                # Partially merge multiple domains into larger ones, then stratified sample n_domain
                 n_mix_domain = int(1.2 * n_domain)
                 sorted_domains = sort_by_count.index
                 large_domains = sorted_domains[:int(0.05 * len(sorted_domains))]
@@ -371,7 +350,8 @@ class DataPreprocessing(object):
                     step = max(1, len(tmp_sorted_domains) // tmp_n_domains)
                     tmp_selected_domains.extend(tmp_sorted_domains[::step][:tmp_n_domains])
 
-                # 随机选择n_mix_domain-n_domain个domain，将其替换成n_domain中的domain，保证最后的domain数目为n_domain
+                # Randomly select n_mix_domain-n_domain domains to replace with ones from n_domain,
+                # ensuring n_domain total domains
                 selected_domains = random.sample(tmp_selected_domains, n_domain)
                 mix_source_domains = set(tmp_selected_domains) - set(selected_domains)
                 mix_target_domains = random.sample(selected_domains, len(mix_source_domains))
@@ -387,7 +367,7 @@ class DataPreprocessing(object):
             print("After select domain with sample_mode:")
             print("After final sample domain 1:", filtered_df["domain"].value_counts())
 
-            # Mapping domains to continuous IDs
+            # Map domain ids to a contiguous range [0, n_selected)
             sorted_domains_from_large = filtered_df["domain"].value_counts().sort_values(ascending=False).index.tolist()
             domain_id_mapping = {domain: i for i, domain in enumerate(sorted_domains_from_large)}
             domain_id_mapping_str = {str(domain): i for i, domain in enumerate(sorted_domains_from_large)}
@@ -395,7 +375,7 @@ class DataPreprocessing(object):
             self.domain2encoder_dict = domain_id_mapping_str
             filtered_df['domain'] = filtered_df['domain'].map(domain_id_mapping)
 
-            # 因为sample完了，可能少了一些user和item，因此可以重新编码
+            # Re-encode userid/itemid after domain sampling to remove gaps and shrink id space
             print("Re-encoding userid and itemid after domain sampling")
             print(f"Before re-encoding, userid max: {filtered_df['userid'].max()}, "
                   f"itemid max: {filtered_df['itemid'].max()}")
@@ -414,12 +394,17 @@ class DataPreprocessing(object):
         return filtered_df, domain_id_mapping, inverse_domain_id_mapping
 
     def update_config(self, config):
+        """
+        Inject preprocessing results back into the global config used by training.
+        """
         config.domain2encoder_dict = self.domain2encoder_dict
         config.preprocess_path = self.preprocess_path
 
     def main(self):
+        """
+        Main preprocessing entry point. If cached preprocessed CSV exists, reuse it
+        """
         if os.path.exists(self.preprocess_path):
-            # data = pd.read_csv(preprocess_path)
             print(f'{self.preprocess_path} already prepared')
         else:
             if self.dataset_name == 'amazon':
@@ -434,12 +419,12 @@ class DataPreprocessing(object):
                         rating_csv_columns = ['itemid', 'userid', 'rating', 'timestamp']
                         df = pd.DataFrame(columns=rating_csv_columns)
 
-                        # 存最近prepare2train_month的交互记录
+                        # Keep only the most recent `prepare2train_month` interactions
                         days_n = 30 * self.prepare2train_month + self.prepare2train_month // 2
                         end_date = int(datetime(2018, 8, 15).timestamp())  # df_total['timestamp'].max()
                         start_date = end_date - int(timedelta(days=days_n).total_seconds())
 
-                        # 分块读取和处理 CSV 文件
+                        # Chunked CSV reading and time filtering
                         for chunk in pd.read_csv(os.path.join(self.data_path, 'all_csv_files.csv'),
                                                  chunksize=int(5e7), header=None, names=rating_csv_columns, engine='c',
                                                  low_memory=False, on_bad_lines='skip'):
@@ -449,13 +434,13 @@ class DataPreprocessing(object):
                         df.to_csv(csv_path, index=False)
                     print(f'df total shape = {df.shape}')
 
-                    # 合并product的meta特征
+                    # Merge product meta features
                     df = self.merge_metadata(df, k_cores=self.k_cores)
                     df.to_csv(mergemeta_path, index=False)
 
                 print('finish loading data. start preprocessing')
 
-                # 稠密特征离散化
+                # Discretize dense features (bucketization for rank/price)
                 df['sales_rank'] = df['sales_rank'].fillna(df['sales_rank'].quantile()).astype(int)  # sales_rank
                 sales_rank_bins = [0] + list(np.exp2(np.arange(2, 21, 2)).astype(int)) + [np.inf]
                 df['sales_rank'] = pd.cut(df['sales_rank'], bins=sales_rank_bins, labels=False)
@@ -465,18 +450,20 @@ class DataPreprocessing(object):
                 df['price'] = pd.cut(df['price'], bins=price_bins, labels=False)
                 df['timestamp'] = df['timestamp'].astype(int)
 
-                # 定长特征数据数字化，itemid already encoded
+                # Encode fixed-length categorical features (itemid already encoded)
                 encoder_feature_names = [fea for fea in self.one_hot_feature_names if (fea!='itemid') and (fea!='domain')]
                 df[encoder_feature_names].fillna('-1', inplace=True)
                 for fea in encoder_feature_names:
                     lbe = LabelEncoder()
                     df[fea] = lbe.fit_transform(df[fea].astype(str))
 
+                # Optional domain filter and mapping to encoder dict
                 df = df.loc[df['domain'].isin(self.domains)] if len(self.domains) > 0 else df
                 df = df.dropna(subset=['domain'])
                 df['domain'] = df['domain'].map(self.domain2encoder_dict)
 
-                data = df[self.feature_names+['label']+['timestamp']]  # timestamp是后续划分训练测试集需要
+                # Keep features + label + timestamp (timestamp used later for temporal split in main/run)
+                data = df[self.feature_names+['label']+['timestamp']]  # timestamp needed for train/test split
                 data.to_csv(self.preprocess_path, index=False)
                 print(f'finish preprocessing {self.preprocess_path}')
             elif self.dataset_name == 'aliccp':
@@ -505,4 +492,5 @@ if __name__ == '__main__':
     random.seed(args.seed)
     np.random.seed(args.seed)
 
+    # Standalone quick preprocessing entry (AliCCP example).
     DataPreprocessing('dataset/aliccp', 'aliccp', downsample_freq_thresh=10, sample_n_domain=50,).main()
