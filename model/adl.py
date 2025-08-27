@@ -12,8 +12,10 @@ import torch.nn.functional as F
 class ADL(BaseModel):
     """
     Reference:
-        Li, Jinyun, et al.
-        "ADL: Adaptive Distribution Learning Framework for Multi-Scenario CTR Prediction."  SIGIR 2023.
+        Jinyun Li, Huiwen Zheng, Yuanlin Liu, Minfang Lu, Lixia Wu, and Haoyuan Hu. 2023.
+        ADL: Adaptive Distribution Learning Framework for Multi-Scenario CTR Prediction.
+        In Proceedings of the 46th International ACM SIGIR Conference on Research and Development in Information
+        Retrieval. 1786–1790.
     """
     def __init__(self, feature_dims, embed_dim,
                  n_tower, tower_dims, domain_idx=None, dropout=0.2,

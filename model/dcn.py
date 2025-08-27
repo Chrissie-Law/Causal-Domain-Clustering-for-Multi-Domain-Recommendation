@@ -11,10 +11,11 @@ from model.layer import BaseModel, MultiLayerPerceptron, CrossNetwork
 
 class DCN(BaseModel):
     """
-    A pytorch implementation of DCN and DCN-V2.
+    A pytorch implementation of DCN.
 
     Reference:
-        Wang R, Fu B, Fu G, et al. Deep & cross network for ad click predictions[C]//Proceedings of the ADKDD'17. ACM, 2017: 12. (https://arxiv.org/abs/1708.05123)
+        Ruoxi Wang, Bin Fu, Gang Fu, and Mingliang Wang. 2017.
+        Deep & cross network for ad click predictions. In Proceedings of the ADKDD’17. 1–7.
     """
 
     def __init__(self, feature_dims, embed_dim, n_cross_layers, mlp_dims, dropout=0.2,

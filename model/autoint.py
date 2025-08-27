@@ -11,7 +11,10 @@ class AutoInt(BaseModel):
     """
     AutoInt Network architecture.
 
-    Reference: Song W, Shi C, Xiao Z, et al. AutoInt: Automatic Feature Interaction Learning via Self-Attentive Neural Networks[J]. arXiv preprint arXiv:1810.11921, 2018.(https://arxiv.org/abs/1810.11921)
+    Reference:
+        Weiping Song, Chence Shi, Zhiping Xiao, Zhijian Duan, Yewen Xu, Ming Zhang, and Jian Tang. 2019.
+        Autoint: Automatic feature interaction learning via self-attentive neural networks.
+        In Proceedings of the 28th ACM international conference on information and knowledge management. 1161–1170.
     """
 
     def __init__(self, feature_dims, embed_dim, atten_embed_dim=None, att_layer_num=3,

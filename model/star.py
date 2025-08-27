@@ -12,10 +12,11 @@ import torch.nn.functional as F
 class STAR(BaseModel):
     """
     STAR based on DCN.
-    Reference: Sheng X R, Zhao L, Zhou G, et al.
-    One model to serve all: Star topology adaptive recommender for multi-domain ctr prediction[C]
-    //Proceedings of the 30th ACM International Conference on Information & Knowledge Management. 2021: 4104-4113.
-
+    Reference:
+        Xiang-Rong Sheng, Liqin Zhao, Guorui Zhou, Xinyao Ding, Binding Dai, Qiang Luo, Siran Yang,
+        Jingshan Lv, Chi Zhang, Hongbo Deng, et al. 2021.
+        One model to serve all: Star topology adaptive recommender for multi-domain ctr prediction.
+        In Proceedings of the 30th ACM International Conference on Information & Knowledge Management. 4104–4113.
     """
 
     def __init__(self, feature_dims, embed_dim,

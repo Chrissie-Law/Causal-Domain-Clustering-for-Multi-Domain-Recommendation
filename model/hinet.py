@@ -22,6 +22,12 @@ class SEI(torch.nn.Module):
 
 
 class HiNet(BaseModel):
+    """
+    Reference:
+        Jie Zhou, Xianshuai Cao, Wenhao Li, Lin Bo, Kun Zhang, Chuan Luo, and Qian Yu. 2023.
+        Hinet: Novel multi-scenario & multi-task learning with hierarchical information extraction.
+        In 2023 IEEE 39th International Conference on Data Engineering (ICDE). IEEE, 2969–2975.
+    """
     def __init__(self, feature_dims, embed_dim=10, n_tower=6, sei_dims=None, tower_dims=None,
                  domain_idx=None, device='cpu', dropout=0.2, config=None,
                  l2_reg_embedding=1e-5, l2_reg_linear=1e-5, l2_reg_dnn=1e-5, l2_reg_cross=1e-5):

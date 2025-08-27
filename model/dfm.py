@@ -11,7 +11,9 @@ class DeepFM(BaseModel):
     A pytorch implementation of DeepFM.
 
     Reference:
-        H Guo, et al. DeepFM: A Factorization-Machine based Neural Network for CTR Prediction, 2017.
+        Huifeng Guo, Ruiming Tang, Yunming Ye, Zhenguo Li, and Xiuqiang He. 2017.
+        DeepFM: a factorization-machine based neural network for CTR prediction.
+        In Proceedings of the 26th International Joint Conference on Artificial Intelligence. 1725–1731.
     """
 
     def __init__(self, feature_dims, embed_dim, mlp_dims, dropout=0.2,
@@ -27,7 +29,7 @@ class DeepFM(BaseModel):
 
         self.output_layer = nn.Sigmoid()
 
-    def forward(self, x):  # 比 wide&deep 多了一个二阶交互项
+    def forward(self, x):
         embed_x = self.embedding(x)
         mlp_input = flatten(embed_x, start_dim=1)
 

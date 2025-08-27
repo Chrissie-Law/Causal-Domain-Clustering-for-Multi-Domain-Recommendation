@@ -8,10 +8,12 @@ from model.layer import BaseModel, MultiLayerPerceptron, CrossNetV2, CrossNetMix
 
 class DCNv2(BaseModel):
     """
-    Deep & Cross Network with a mixture of low-rank architecture
+    DCNv2 model.
 
-    Reference: Wang R, Shivanna R, Cheng D Z, et al. DCN-M: Improved Deep & Cross Network for Feature Cross Learning in Web-scale Learning to Rank Systems[J]. 2020. (https://arxiv.org/abs/2008.13535)
-
+    Reference:
+        Ruoxi Wang, Rakesh Shivanna, Derek Cheng, Sagar Jain, Dong Lin, Lichan Hong, and Ed Chi. 2021.
+        Dcn v2: Improved deep & cross network and practical lessons for web-scale learning to rank systems.
+        In Proceedings of the web conference 2021. 1785–1797.
 
     Args:
         features (list[Feature Class]): training by the whole module.

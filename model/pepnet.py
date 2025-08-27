@@ -9,9 +9,10 @@ from model.layer import BaseModel, MultiLayerPerceptron, CrossNetwork
 class PEPNet(BaseModel):
     """
     PEPNet based on DCN or AutoInt.
-    Reference: Chang J, Zhang C, Hui Y, et al.
-    Pepnet: Parameter and embedding personalized network for infusing with personalized prior information[C]
-    //Proceedings of the 29th ACM SIGKDD Conference on Knowledge Discovery and Data Mining. 2023: 3795-3804.
+    Reference:
+        Jianxin Chang, Chenbin Zhang, Yiqun Hui, Dewei Leng, Yanan Niu, Yang Song, and Kun Gai. 2023.
+        Pepnet: Parameter and embedding personalized network for infusing with personalized prior information.
+        In Proceedings of the 29th ACM SIGKDD Conference on Knowledge Discovery and Data Mining. 3795–3804.
     """
     def __init__(self, feature_dims, embed_dim, n_tower, tower_dims, gate_hidden_dim=64,
                  domain_idx=None, use_ppnet=True, dropout=0.2, config=None,

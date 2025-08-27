@@ -67,6 +67,12 @@ class DNN_w_Pruner(nn.Module):
 
 
 class AdaSparse(BaseModel):
+    """
+    Reference:
+        Xuanhua Yang, Xiaoyu Peng, Penghui Wei, Shaoguo Liu, Liang Wang, and Bo Zheng. 2022.
+        Adasparse: Learning adaptively sparse structures for multi-domain click-through rate prediction.
+        In Proceedings of the 31st ACM International Conference on Information & Knowledge Management. 4635–4639.
+    """
     def __init__(self, feature_dims, embed_dim, hidden_dims, domain_idx=None,
                  dropout=0.2, config=None,
                  l2_reg_embedding=1e-5, l2_reg_linear=1e-5, l2_reg_dnn=1e-5, l2_reg_cross=1e-5):

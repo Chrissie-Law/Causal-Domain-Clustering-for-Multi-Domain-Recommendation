@@ -9,12 +9,12 @@ from model.layer import BaseModel, MultiLayerPerceptron, CrossNetwork
 
 class MMoE(BaseModel):
     """
-    Multi-gate Mixture-of-Experts model. MMoE与DCN concat后过linear层，在与线性输出相加，效果较好，即is_concat_linear_cn=False.
+    Multi-gate Mixture-of-Experts model.
     Reference:
-    Jiaqi Ma, et al. MMoE:
-    Modeling Task Relationships in Multi-task Learning with Multi-gate Mixture-of-Experts, 2018.
+    Jiaqi Ma, Zhe Zhao, Xinyang Yi, Jilin Chen, Lichan Hong, and Ed H Chi. 2018.
+    Modeling task relationships in multi-task learning with multi-gate mixture-of-experts.
+    In Proceedings of the 24th ACM SIGKDD international conference on knowledge discovery & data mining. 1930–1939.
     """
-
     def __init__(self, feature_dims, embed_dim, n_tower, n_expert,
                  expert_dims, tower_dims, dropout=0.2, config=None,
                  l2_reg_embedding=1e-5, l2_reg_linear=1e-5, l2_reg_dnn=1e-5, l2_reg_cross=1e-5,

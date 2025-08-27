@@ -22,6 +22,31 @@ import os
 
 
 class CDC(BaseModel):
+    """
+    CDC: Causal Domain Clustering Model
+
+    This class implements the core logic for Causal Domain Clustering (CDC), which learns to group domains
+    for multi-domain recommendation using causal affinity metrics. It dynamically updates domain-to-cluster
+    assignments and handles warm-up and group-based forward passes.
+
+    Args:
+        feature_dims (list): Input feature dimensions.
+        embed_dim (int): Dimension of embedding vectors.
+        n_tower (int): Number of output towers (clusters).
+        n_domain (int): Total number of domains.
+        base_model (str): The base multi-task model to wrap (e.g., 'mmoe', 'ple', etc.).
+        expert_dims (list): Dimensions for expert layers.
+        tower_dims (list): Dimensions for tower layers.
+        domain_idx (int): Index of the domain feature in the input tensor.
+        domain_cnt_weight (list or tensor): Weight for each domain used in group selection.
+        n_causal_mask (int): Number of causal masks used in causal matrix computation.
+        use_metric (str): Metric for computing domain-group affinity (e.g., 'loss', 'auc').
+        device (str): Computation device.
+        dropout (float): Dropout rate.
+        config (object): Config object with method hyperparameters.
+        savefig_folder (str): Path to save intermediate visualizations.
+        l2_reg_* (float): L2 regularization weights.
+    """
     def __init__(self, feature_dims, embed_dim, n_tower, n_domain, base_model,
                  expert_dims, tower_dims, domain_idx, domain_cnt_weight=None, n_causal_mask=50, use_metric='loss',
                  device='cpu', dropout=0.2, config=None, savefig_folder='',
@@ -69,18 +94,23 @@ class CDC(BaseModel):
 
         self.domain2group = torch.zeros(n_domain, dtype=torch.int64, device=device)
         self.domain2group_list = [0] * n_domain
-        self.s_group2domain_list = [list(range(n_domain))]
-        self.t_group2domain_list = [list(range(n_domain))]
+        self.s_group2domain_list = [list(range(n_domain))]  # Source domains for each group
+        self.t_group2domain_list = [list(range(n_domain))]  # Target domains for each group
         self.initial_s_group2domain_list = None
         self.call_update_group = 0
         self.p_weight = config.p_weight
         self.p_weight_method = config.p_weight_method
 
+        # Initialize affinity matrices
+        # matrix_A: Isolated Domain Affinity Matrix for non-interaction domain transfers
         self.matrix_A = torch.zeros((n_domain+1, n_domain), dtype=torch.float32, device=device)  # n_domain + 1: only warm up
+        # matrix_B: Hybrid Domain Affinity Matrix for domain synergy/interference during joint training
         self.matrix_B = torch.zeros((n_domain+self.n_cluster, n_domain), dtype=torch.float32, device=device)  # n_domain + n_cluster: all domains in that cluster
+        # Matrices for causal discovery
         self.matrix_mask = torch.zeros((n_causal_mask, n_domain), dtype=torch.float32, device=device)
         self.matrix_causal = torch.zeros((n_causal_mask, n_domain), dtype=torch.float32, device=device)
 
+        # Storage for historical matrices
         self.old_matrix_A, self.old_matrix_B, self.old_matrix_mask = None, None, None
         self.old_matrix_weight = config.old_matrix_weight
 
@@ -94,10 +124,18 @@ class CDC(BaseModel):
 
     def forward(self, x, mode='split', domain_i=None):
         """
-        mode: warmup, split
+        Forward pass for the CDC model.
+
+        Args:
+            x (Tensor): Input feature tensor.
+            mode (str): Running mode ('warmup' uses shared tower; 'split' uses group-specific tower).
+            domain_i (int): Optional target domain index (for evaluation).
+
+        Returns:
+            Tensor: Model output for the corresponding group or average tower.
         """
         if mode == 'warmup':
-            # warm-up阶段多个tower取第一个
+            # During warm-up, use the average prediction from all towers
             y_cat = self.base_model_instance.forward(x)
             return torch.mean(y_cat, dim=1)
         if mode == 'split':
@@ -111,6 +149,12 @@ class CDC(BaseModel):
                 return y_cat[:, group]
 
     def get_matrix_metric(self, preds, targets):
+        """
+        Compute domain affinity metric between prediction and label.
+
+        Returns:
+            float: Either BCE loss or AUC score.
+        """
         if self.use_metric == 'loss':
             res = F.binary_cross_entropy(preds, targets)
             return res.detach()
@@ -119,6 +163,21 @@ class CDC(BaseModel):
             return res
 
     def update_group(self, mode='iterative'):
+        """
+        Update domain groupings using the Co-Optimized Dynamic Clustering algorithm.
+
+        This method implements the key CDC algorithm that:
+        1. Updates the affinity matrices based on transfer effects
+        2. Calculates causal distances between domains
+        3. Either initializes groups using causal distances or updates existing groups
+        4. For each target group, finds the optimal source domain set
+
+        Args:
+            mode: Grouping mode ('iterative' or 'greedy')
+
+        Returns:
+            Updated domain-to-group mapping list
+        """
         self.call_update_group += 1
         self.update_p_weight()
         print(f'\n======= "update_group" call_update_group-{self.call_update_group}, '
@@ -127,17 +186,17 @@ class CDC(BaseModel):
             print(f'old_matrix_weight: {self.old_matrix_weight}')
             self.matrix_A = self.old_matrix_A * self.old_matrix_weight + self.matrix_A * (1 - self.old_matrix_weight)
             self.matrix_B = self.old_matrix_B * self.old_matrix_weight + self.matrix_B * (1 - self.old_matrix_weight)
-            # self.matrix_mask = self.old_matrix_mask * self.old_matrix_weight + self.matrix_mask * (1 - self.old_matrix_weight)
 
         self.old_matrix_A = copy.deepcopy(self.matrix_A)
         self.old_matrix_B = copy.deepcopy(self.matrix_B)
         self.old_matrix_mask = copy.deepcopy(self.matrix_mask)
 
+        # Normalize matrices based on affinity function
         if self.config.affinity_func == 'minus':  # less is better
             self.matrix_A[:-1] -= self.matrix_A[-1]
-            # 计算每个domain行的cluster的索引，并更新matrix_B
+            # Update matrix_B based on domain cluster indices
             self.matrix_B[:self.n_domain] = self.matrix_B[self.domain2group + self.n_domain] - self.matrix_B[:self.n_domain]
-            self.matrix_mask = self.matrix_mask - self.matrix_A[-1]  # 减去纯预热的
+            self.matrix_mask = self.matrix_mask - self.matrix_A[-1]  # Subtract warm-up baseline
         elif self.config.affinity_func == 'divide':  # large is better
             self.matrix_A[:-1] = 1 - self.matrix_A[:-1]/self.matrix_A[-1]
             self.matrix_B[:self.n_domain] = 1 - self.matrix_B[self.domain2group + self.n_domain]/self.matrix_B[:self.n_domain]
@@ -145,16 +204,18 @@ class CDC(BaseModel):
         else:
             raise ValueError('Unknown affinity_func: ' + self.config.affinity_func)
 
+        # Calculate causal distance matrix using dependence contribution kernel
         self.matrix_causal = self.calc_causal_matrix(self.matrix_mask.T)
         self.matrix_causal = torch.tensor(np.arccos(self.matrix_causal), dtype=torch.float32, device=self.device)
 
+        # Save visualization of matrices
         self.save_draw_matrix(self.matrix_A, 'matrix_A', is_illustration=True)
         self.save_draw_matrix(self.matrix_B, 'matrix_B', is_illustration=True)
         self.save_draw_matrix(self.matrix_mask, 'matrix_mask', is_illustration=True)
         self.save_draw_matrix(self.matrix_causal, 'causal_matrix', is_illustration=True)
 
         if max(self.domain2group_list) == 0:
-            # 初始化时，根据因果距离直接分组
+            # Initialize groups based on causal distances using k-means
             t_group0 = self.kmeans_group(self.matrix_causal.cpu().numpy(), self.n_cluster)
             self.domain2group_list = t_group0
             self.domain2group = torch.tensor(t_group0, dtype=torch.int64, device=self.device)
@@ -168,12 +229,13 @@ class CDC(BaseModel):
                 self.s_group2domain_list.append(self.get_source_domain(t_group2domain_list[c], group_idx=c))
             self.initial_s_group2domain_list = copy.deepcopy(self.s_group2domain_list)
         else:
+            # Update existing groups
             t_group2domain_list = self.t_group2domain_list
             print(f't_group2domain_list0: {t_group2domain_list}')
             domain_queue = list(range(self.n_domain))
             t_group, s_group = [[] for _ in range(self.n_cluster)], [[] for _ in range(self.n_cluster)]
             domain2group_metric = torch.empty(self.n_domain, self.n_cluster)
-            # 计算group的中心domain
+            # Find center domains for each group
             centers = [self.get_center_domain_in_group(t_group2domain_list[c])[0] for c in range(self.n_cluster)]
             for c in range(self.n_cluster):
                 t_group[c].append(centers[c])
@@ -181,6 +243,7 @@ class CDC(BaseModel):
                 domain2group_metric[centers[c], :] = self.default_metric_value
 
             if mode == 'iterative':
+                # Iterative assignment of domains to groups
                 is_domain_queue_update = True
                 while domain_queue and is_domain_queue_update:
                     is_domain_queue_update = False
@@ -193,7 +256,6 @@ class CDC(BaseModel):
                         best_domain = torch.argmax(domain2group_metric, dim=0)  # shape: n_cluster
                     else:
                         best_domain = torch.argmin(domain2group_metric, dim=0)
-                    # print(f'best_domain: {best_domain}')
                     for c in range(self.n_cluster):
                         if self.is_max_metric_value_better:
                             flag = (torch.argmax(domain2group_metric[best_domain[c], :]) == c)
@@ -210,6 +272,7 @@ class CDC(BaseModel):
                     print('domain2group_metric:', domain2group_metric[domain_queue, :])
                     raise ValueError('target domain_queue is not empty')
             elif mode == 'greedy':
+                # Greedy assignment of domains to groups
                 for c in range(self.n_cluster):
                     s_group[c] = self.get_source_domain(t_group[c], group_idx=c)
                 for d in domain_queue:
@@ -224,6 +287,7 @@ class CDC(BaseModel):
                         best_group = torch.argmin(domain2group_metric[d, :])
                         t_group[best_group].append(d)
 
+            # Update domain-to-group mappings
             self.t_group2domain_list = t_group
             print(f't_group2domain_list updated: {t_group}')
             domain2group_array = np.array([0] * self.n_domain)
@@ -238,13 +302,23 @@ class CDC(BaseModel):
         return self.domain2group_list
 
     def get_source_domain(self, t_group, group_idx):
-        # print(f'======= "get_source_domain" call_update_group-{self.call_update_group}, group_idx-{group_idx}, t_group: {t_group} =======')
-        # init
+        """
+        Selects a subset of source domains within the current target group
+        to maximize beneficial transfer based on domain weights and causal matrices.
+
+        Args:
+            t_group (list): Current target domain indices.
+            group_idx (int): Current group ID.
+
+        Returns:
+            list: Source domain indices for the group.
+        """
+        # Initialize with center domains
         s_group = self.get_center_domain_in_group(t_group, center_num=2)
         has_useful_domain = True
 
         while has_useful_domain and len(s_group) < self.n_domain:
-            # 场景d_i对测试场景d_t的增益
+            # Calculate domain interaction coefficients (lambda) for each domain
             lambda_t_k = []
             for d_i in range(self.n_domain):
                 if d_i in s_group:
@@ -255,11 +329,13 @@ class CDC(BaseModel):
             lambda_t_k = torch.stack(lambda_t_k, dim=0)
             assert lambda_t_k.shape == (self.n_domain, len(t_group))
 
+            # Adjust domain weights based on sample counts
             domain_weights_adjusted = self.domain_cnt_weight[t_group]
             sum_weights = domain_weights_adjusted.sum()
             if sum_weights != 0:
                 domain_weights_adjusted = domain_weights_adjusted/sum_weights
 
+            # Calculate transfer gain J using integrated matrices
             A_selected = self.matrix_A[:self.n_domain, t_group]
             B_selected = self.matrix_B[:self.n_domain, t_group]
             J = (((1 - lambda_t_k) * A_selected + lambda_t_k * B_selected)*domain_weights_adjusted).sum(dim=1)  # shape: n_domain
@@ -267,9 +343,8 @@ class CDC(BaseModel):
 
             if self.initial_s_group2domain_list is None:
                 result = J
-                # print('result:', result)
             else:
-                # 计算d_i在最终的S的可能性，越大越好
+                # Calculate domain affiliation score P to enhance robustness
                 P = (1 - 2*self.calc_domain_lambda_in_group(
                     group=self.initial_s_group2domain_list[group_idx])) * torch.pow(self.domain_cnt_weight, 0.5)
                 P_weight = self.p_weight
@@ -277,10 +352,6 @@ class CDC(BaseModel):
                     result = J + P_weight * P
                 else:
                     result = J - P_weight * P
-                # print('J:', J)
-                # print('P:', P)
-                # print('P_weight:', P_weight)
-                # print('result:', result)
             result[s_group] = self.default_metric_value
             if self.is_max_metric_value_better:
                 best_value, best_domain = torch.max(result, 0)
@@ -289,13 +360,14 @@ class CDC(BaseModel):
                 best_value, best_domain = torch.min(result, 0)
                 has_useful_domain = (best_value < 0)
             if has_useful_domain:
-                # print(f'best_domain: {best_domain.item()}')
                 s_group.append(best_domain.item())
-        # print(f't_group: {t_group}, get_source_domain: {s_group}')
-        # print(f'======= end "get_source_domain" call_update_group-{self.call_update_group}, group_idx-{group_idx} =======')
         return s_group
 
     def update_p_weight(self):
+        """
+        Update the p_weight (prior term in domain selection)
+        using one of the decay strategies: linear, quadratic, or exponential.
+        """
         if self.p_weight > 1e-10:
             if self.p_weight_method == 'linear_decay':
                 self.p_weight = self.config.p_weight / self.call_update_group
@@ -306,19 +378,42 @@ class CDC(BaseModel):
         print('call_update_group:', self.call_update_group, 'p_weight:', self.p_weight)
 
     def calc_metric_in_source_group(self, target_domain, s_group):
+        """
+        Calculate the domain-to-group affinity score for assigning target_domain
+        to a specific source group, considering lambda weights.
+
+        Returns:
+            float: Metric value.
+        """
         lambda_domain = self.calc_domain_lambda_in_group(group=s_group, domain=[target_domain])
         domain_metric = torch.sum((1-lambda_domain) * self.matrix_A[s_group, target_domain] +
                                   lambda_domain * self.matrix_B[s_group, target_domain])
         return domain_metric
 
     def get_center_domain_in_group(self, group, center_num=1):
+        """
+        Get the central domain(s) from the group based on minimum average causal distance.
+
+        Returns:
+            list: Domain indices closest to group center.
+        """
         center_num = min(center_num, len(group))
         domain_distance = self.calc_domain_lambda_in_group(group=group, domain=group)
         best_values, best_domains = torch.topk(domain_distance, k=center_num, largest=False)
-        # print(f'"get_center_domain_in_group" group: {group}, center_num: {center_num}, best_domains: {best_domains}')
         return [group[i] for i in best_domains]
 
     def calc_domain_lambda_in_group(self, group, domain=None, mode='avg_dis'):
+        """
+        Compute lambda weights based on domain similarity (causal distance) between each domain and a group of domains.
+
+        Args:
+            group (list): Group of domains.
+            domain (list): Target domains (defaults to all domains).
+            mode (str): Strategy for computing lambda.
+
+        Returns:
+            Tensor: Lambda values for the domains.
+        """
         if mode == 'avg_dis':
             group_dis = self.matrix_causal[np.ix_(group, group)]
             group_total_dis = torch.sum(group_dis)
@@ -333,11 +428,6 @@ class CDC(BaseModel):
             domain_similar_values = torch.clamp(domain_values, min=0, max=1)
             assert domain_similar_values.shape[0] == len(domain)
 
-            # if domain is None:
-            #     domain_similar = torch.sum(self.matrix_causal[group], dim=0)  # shape: n_domain
-            # else:
-            #     domain_similar = torch.sum(self.matrix_causal[np.ix_(group, domain)], dim=0)  # shape: len(domain)
-            # return torch.clamp(domain_similar / group_similar, min=0, max=1)
             return domain_similar_values
 
     def save_model_state(self):
@@ -346,7 +436,7 @@ class CDC(BaseModel):
         pattern = re.compile(regex_pattern)
 
         full_state_dict = self.state_dict()
-        # 使用正则表达式进行匹配
+        # Match parameters using regex
         selected_state_dict = {k: v for k, v in full_state_dict.items() if pattern.match(k)}
         self.model_state = copy.deepcopy(selected_state_dict)
 
@@ -358,14 +448,27 @@ class CDC(BaseModel):
 
     @staticmethod
     def kmeans_group(matrix_causal, n_cluster):
+        """
+        Group domains using k-means clustering on causal distances.
+        """
         kmeans = KMeans(n_clusters=n_cluster).fit(matrix_causal)
         return kmeans.labels_
 
     @staticmethod
     def calc_causal_matrix(X, alpha=None):
         """
-        References: A Distance Covariance-based Kernel for Nonlinear Causal Clustering in Heterogeneous Populations
+        Calculate causal dependence contribution kernel matrix.
+
+        Reference:
+        - A Distance Covariance-based Kernel for Nonlinear Causal Clustering in Heterogeneous Populations
         https://causal.dev/code/dep_con_kernel.py
+
+        Args:
+            X (ndarray or Tensor): Input matrix (treatment -> domain effects).
+            alpha (float): Optional statistical threshold for sparsity.
+
+        Returns:
+            ndarray: Causal similarity matrix (cosine-based).
         """
         if not isinstance(X, np.ndarray):
             X = X.cpu().numpy()
@@ -393,6 +496,14 @@ class CDC(BaseModel):
         return kappa
 
     def save_draw_matrix(self, matrix, name, is_illustration=False):
+        """
+        Save matrix as Excel file and optionally visualize as a heatmap.
+
+        Args:
+            matrix (Tensor or ndarray): Matrix to save.
+            name (str): File name identifier.
+            is_illustration (bool): Whether to draw and save heatmap visualization.
+        """
         if isinstance(matrix, torch.Tensor):
             matrix = matrix.cpu().numpy()
         df = pd.DataFrame(matrix)

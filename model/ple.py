@@ -8,9 +8,11 @@ from model.layer import BaseModel, MultiLayerPerceptron, CrossNetwork
 
 class PLE(BaseModel):
     """
-    Progressive Layered Extraction model. PLE无论如何concat DCN效果都会下降，因此不加入DCN
-    Reference: Hongyan Tang, et al. PLE: Progressive Layered Extraction (PLE):
-        A Novel Multi-Task Learning (MTL) Model for Personalized Recommendations, 2020.
+    Progressive Layered Extraction model.
+    Reference:
+        Hongyan Tang, Junning Liu, Ming Zhao, and Xudong Gong. 2020.
+        Progressive layered extraction (ple): A novel multi-task learning (mtl) model for personalized recommendations.
+        In Proceedings of the 14th ACM Conference on Recommender Systems. 269–278.
     """
 
     def __init__(self, feature_dims, embed_dim, n_tower,
@@ -24,7 +26,6 @@ class PLE(BaseModel):
         self.n_tower = n_tower
         self.use_dcn = getattr(config, 'use_dcn', False)
         self.use_atten = getattr(config, 'use_atten', False)
-
 
         if self.use_dcn:
             self.cn = CrossNetwork(self.embed_output_dim, config.n_cross_layers)
@@ -49,7 +50,6 @@ class PLE(BaseModel):
 
     def forward(self, x):
         embed_x = self.embedding(x, squeeze_dim=True)  #[batch_size, input_dims]
-        # cn_out = self.cn(embed_x)
 
         ple_inputs = [embed_x] * (self.n_tower + 1)
         ple_outs = []
